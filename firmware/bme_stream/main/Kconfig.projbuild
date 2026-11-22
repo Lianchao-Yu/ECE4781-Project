@@ -1,0 +1,35 @@
+menu "BME acquisition"
+
+    config BME_GPIO_EMG
+        int "EMG input pin (ADC1, GPIO1-GPIO10)"
+        range 1 10
+        default 4
+        help
+            ADC1 pin that receives the EMG front-end output.
+            GPIO4 is ADC1_CH3 on the ESP32-S3 and is free of strapping,
+            USB and flash/PSRAM duties.
+
+    config BME_GPIO_PPG
+        int "PPG input pin (ADC1, GPIO1-GPIO10)"
+        range 1 10
+        default 5
+        help
+            ADC1 pin that receives the PPG front-end output (ADC1_CH4).
+
+    config BME_GPIO_EDA
+        int "EDA input pin (ADC1, GPIO1-GPIO10)"
+        range 1 10
+        default 6
+        help
+            ADC1 pin that receives the EDA front-end output (ADC1_CH5).
+
+    config BME_BENCH_MODE
+        bool "Bench mode (inputs left floating, no sensors attached)"
+        default y
+        help
+            Enable while testing the board without sensors. Floating ADC
+            pins produce random readings, which the host plots as a liveness
+            check. The flag is reported in every frame so the PC can label
+            the data as bench instead of live.
+
+endmenu

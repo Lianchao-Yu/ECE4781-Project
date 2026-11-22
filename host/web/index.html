@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BME 3-Channel Live Monitor (Web Bluetooth)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 20px 24px;
+    font-family: "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
+    background: #16161a; color: #d8d8de;
+  }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0 12px 0 0; letter-spacing: .3px; }
+  button {
+    background: #26262d; color: #e6e6ec; border: 1px solid #3a3a44;
+    padding: 7px 14px; border-radius: 7px; font-size: 13px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover:not(:disabled) { background: #31313a; border-color: #4c4c5a; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: #1d6fb8; border-color: #2a86d6; }
+  button.primary:hover:not(:disabled) { background: #2380d2; }
+  #status { margin-left: auto; font-size: 13px; color: #9a9aa8; font-variant-numeric: tabular-nums; }
+  .grid { display: grid; grid-template-rows: repeat(3, minmax(150px, 1fr)); gap: 10px; height: calc(100vh - 120px); }
+  .panel { position: relative; background: #1c1c22; border: 1px solid #2b2b34; border-radius: 10px; overflow: hidden; }
+  .panel canvas { width: 100%; height: 100%; display: block; }
+  .tag {
+    position: absolute; left: 12px; top: 8px; font-size: 12px; letter-spacing: .4px;
+    color: #8f8fa0; pointer-events: none;
+  }
+  .tag b { color: #cfcfdb; font-weight: 600; }
+  .warn {
+    margin-top: 10px; font-size: 12.5px; color: #b08e5a; line-height: 1.5;
+  }
+  #log { margin-top: 6px; font-size: 12px; color: #6f6f80; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>BME 3-Channel Live Monitor</h1>
+  <button id="btnConnect" class="primary">Connect device</button>
+  <button id="btnStart" disabled>Start streaming</button>
+  <button id="btnStop" disabled>Stop streaming</button>
+  <button id="btnRecord" disabled>Start recording</button>
+  <button id="btnDownload" disabled>Download CSV</button>
+  <span id="status">Not connected</span>
+</header>
+
+<div class="grid">
+  <div class="panel"><div class="tag"><b>EMG</b> 1 kHz</div><canvas id="emg"></canvas></div>
+  <div class="panel"><div class="tag"><b>PPG</b> 100 Hz</div><canvas id="ppg"></canvas></div>
+  <div class="panel"><div class="tag"><b>EDA</b> 100 Hz (low-pass)</div><canvas id="eda"></canvas></div>
+</div>
+
+<div class="warn">Web Bluetooth requires Chrome or Edge, and the page must be served over https or localhost.<br>
+If opening the file directly does not work, run <code>python -m http.server 8000</code> and open http://localhost:8000/web/</div>
+<div id="log"></div>
+
+<script>
+"use strict";
+
+const SERVICE_UUID = "5f9b1c00-3e4a-4d21-9a77-0b1c2d3e4f50";
+const TX_UUID = "5f9b1c01-3e4a-4d21-9a77-0b1c2d3e4f50";
+const RX_UUID = "5f9b1c02-3e4a-4d21-9a77-0b1c2d3e4f50";
+const FRAME_SIZE = 31;
+
+const EMG_FS = 1000, PPG_FS = 100, EDA_FS = 100;
+const EMG_WIN = 4000, PPG_WIN = 600, EDA_WIN = 3000;
+
+/* ---------------------------------------------------------------- ring buffer */
+class Ring {
+  constructor(size) { this.buf = new Float32Array(size); this.size = size; this.head = 0; this.count = 0; }
+  push(v) { this.buf[this.head] = v; this.head = (this.head + 1) % this.size; if (this.count < this.size) this.count++; }
+  /* Last n samples in time order; returns fewer while the buffer is filling. */
+  tail(n) {
+    n = Math.min(n, this.count);
+    const out = new Float32Array(n);
+    const start = (this.head - n + this.size) % this.size;
+    for (let i = 0; i < n; i++) out[i] = this.buf[(start + i) % this.size];
+    return out;
+  }
+  clear() { this.head = 0; this.count = 0; this.buf.fill(0); }
+}
+
+const ch = {
+  emg: { ring: new Ring(EMG_WIN), fs: EMG_FS, canvas: document.getElementById("emg"), color: "#4fc3f7", ymin: -20000, ymax: 20000 },
+  ppg: { ring: new Ring(PPG_WIN), fs: PPG_FS, canvas: document.getElementById("ppg"), color: "#ef5350", ymin: -6000, ymax: 6000 },
+  eda: { ring: new Ring(EDA_WIN), fs: EDA_FS, canvas: document.getElementById("eda"), color: "#9ccc65", ymin: -5000, ymax: 5000 },
+};
+
+/* ---------------------------------------------------------------- drawing */
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+  }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function windowSeconds(cfg) {
+  return cfg === ch.emg ? 4 : cfg === ch.ppg ? 6 : 30;
+}
+
+function drawChannel(cfg) {
+  const { ctx, w, h } = fitCanvas(cfg.canvas);
+  ctx.clearRect(0, 0, w, h);
+
+  /* grid */
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 5; i++) {
+    const y = (h * i) / 5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  for (let i = 1; i < 8; i++) {
+    const x = (w * i) / 8;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+
+  const data = cfg.ring.tail(Math.floor(cfg.fs * windowSeconds(cfg)));
+  if (data.length < 2) return;
+
+  /* Auto range: follow the signal inside the nominal limits. */
+  let lo = cfg.ymin, hi = cfg.ymax;
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < data.length; i++) { if (data[i] < mn) mn = data[i]; if (data[i] > mx) mx = data[i]; }
+  if (mx > mn) {
+    const pad = (mx - mn) * 0.15 + 1;
+    lo = mn - pad;
+    hi = mx + pad;
+    /* Clamp the span so one spike cannot flatten the trace. */
+    const maxSpan = (cfg.ymax - cfg.ymin);
+    if (hi - lo > maxSpan) { const c = (hi + lo) / 2; lo = c - maxSpan / 2; hi = c + maxSpan / 2; }
+  }
+
+  ctx.strokeStyle = cfg.color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  const n = data.length;
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * w;
+    const y = h - ((data[i] - lo) / (hi - lo)) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  /* latest value */
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.font = "11px monospace";
+  ctx.textAlign = "right";
+  ctx.fillText(data[n - 1].toFixed(0), w - 10, h - 10);
+}
+
+/* ---------------------------------------------------------------- BLE */
+let device = null, rxChar = null, notifying = false;
+let buf = new Uint8Array(0);
+let stats = { frames: 0, lost: 0, lastSeq: null, samples: 0, t0: performance.now(), rate: 0 };
+let benchMode = false, saturated = false;
+
+let recording = false;
+let records = [];
+
+function log(msg) { document.getElementById("log").textContent = msg; }
+function setStatus(text) { document.getElementById("status").textContent = text; }
+
+async function connect() {
+  if (!navigator.bluetooth) { log("This browser has no Web Bluetooth support, use Chrome or Edge"); return; }
+  try {
+    log("Choosing device ...");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "BME-S3" }],
+      optionalServices: [SERVICE_UUID],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    await attach(device);
+  } catch (err) {
+    log("Connect failed: " + err.message);
+    setStatus("Not connected");
+  }
+}
+
+/* Reconnecting to an already authorised device needs no picker. */
+async function attach(dev) {
+  log("Connecting ...");
+  const server = await dev.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE_UUID);
+  const tx = await service.getCharacteristic(TX_UUID);
+  rxChar = await service.getCharacteristic(RX_UUID);
+
+  await tx.startNotifications();
+  tx.addEventListener("characteristicvaluechanged", onNotify);
+  notifying = true;
+
+  document.getElementById("btnConnect").disabled = true;
+  for (const id of ["btnStart", "btnStop", "btnRecord"]) document.getElementById(id).disabled = false;
+  setStatus("Connected");
+  log(`Connected to ${dev.name || ""}`);
+  resetStats();
+}
+
+function onDisconnected() {
+  notifying = false;
+  rxChar = null;
+  document.getElementById("btnConnect").disabled = false;
+  for (const id of ["btnStart", "btnStop", "btnRecord"]) document.getElementById(id).disabled = true;
+  if (!device) { setStatus("Disconnected"); return; }
+  setStatus("Disconnected, waiting for the device ...");
+  setTimeout(retryConnect, 2000);
+}
+
+async function retryConnect() {
+  if (!device || notifying) return;
+  try {
+    await attach(device);
+  } catch (e) {
+    log("Device not ready yet, still waiting ...");
+    setTimeout(retryConnect, 2000);
+  }
+}
+
+async function sendCmd(value) {
+  if (!rxChar) return;
+  try { await rxChar.writeValueWithoutResponse(new Uint8Array([value])); }
+  catch (e) { log("Command failed: " + e.message); }
+}
+
+/* ---------------------------------------------------------------- frame parsing */
+function onNotify(event) {
+  const dv = event.target.value;
+  const incoming = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  const merged = new Uint8Array(buf.length + incoming.length);
+  merged.set(buf); merged.set(incoming, buf.length);
+  buf = merged;
+
+  while (buf.length >= FRAME_SIZE) {
+    if (buf[0] !== 0xA5 || buf[1] !== 0x5A) {
+      /* Drop bytes until the next magic word. */
+      let i = 1;
+      while (i < buf.length - 1 && !(buf[i] === 0xA5 && buf[i + 1] === 0x5A)) i++;
+      buf = buf.slice(i);
+      continue;
+    }
+    parseFrame(buf.subarray(0, FRAME_SIZE));
+    buf = buf.slice(FRAME_SIZE);
+  }
+}
+
+function parseFrame(f) {
+  const dv = new DataView(f.buffer, f.byteOffset, FRAME_SIZE);
+  const flags = dv.getUint8(3);
+  const seq = dv.getUint16(4, true);
+  const nEmg = dv.getUint8(6);
+  benchMode = (flags & 0x01) !== 0;
+  saturated = (flags & 0x02) !== 0;
+
+  const emgVals = new Float32Array(nEmg);
+  for (let i = 0; i < nEmg; i++) emgVals[i] = dv.getInt16(7 + i * 2, true);
+  const ppg = dv.getInt16(27, true);
+  const eda = dv.getInt16(29, true);
+
+  for (const v of emgVals) ch.emg.ring.push(v);
+  ch.ppg.ring.push(ppg);
+  ch.eda.ring.push(eda);
+
+  if (stats.lastSeq !== null) {
+    const gap = (seq - stats.lastSeq) & 0xFFFF;
+    /* A huge gap means the device rebooted, not that packets were lost. */
+    if (gap > 1 && gap < 6000) stats.lost += gap - 1;
+  }
+  stats.lastSeq = seq;
+  stats.frames++;
+  stats.samples += nEmg;
+
+  if (recording) {
+    const now = performance.now();
+    for (let i = 0; i < nEmg; i++) {
+      records.push([((now - stats.t0) / 1000).toFixed(3), emgVals[i].toFixed(0), ppg, eda]);
+    }
+  }
+}
+
+function resetStats() {
+  stats = { frames: 0, lost: 0, lastSeq: null, samples: 0, t0: performance.now(), rate: 0 };
+  buf = new Uint8Array(0);
+  for (const k of Object.keys(ch)) ch[k].ring.clear();
+}
+
+/* ---------------------------------------------------------------- recording */
+function toggleRecord() {
+  recording = !recording;
+  const btn = document.getElementById("btnRecord");
+  btn.textContent = recording ? "Stop recording" : "Start recording";
+  document.getElementById("btnDownload").disabled = recording || records.length === 0;
+  if (recording) { records = []; stats.t0 = performance.now(); log("Recording started"); }
+  else { log(`Recording stopped, ${records.length} samples`); }
+}
+
+function downloadCsv() {
+  if (!records.length) return;
+  const lines = ["time_s,emg,ppg,eda"];
+  for (const r of records) lines.push(r.join(","));
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `bme_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------------------------------------------------------------- main loop */
+let lastRateT = performance.now(), lastFrames = 0;
+
+function tick() {
+  requestAnimationFrame(tick);
+  for (const key in ch) drawChannel(ch[key]);
+
+  const now = performance.now();
+  if (now - lastRateT > 1000) {
+    const df = stats.frames - lastFrames;
+    stats.rate = (df * 10) / ((now - lastRateT) / 1000);  /* 10 EMG samples per frame */
+    lastRateT = now;
+    lastFrames = stats.frames;
+
+    if (!notifying) return;
+    const total = stats.frames + stats.lost;
+    const loss = total ? (100 * stats.lost) / total : 0;
+    const mode = benchMode ? "bench" : "live";
+    setStatus(`${mode} | ${stats.rate.toFixed(0)} Hz | frames ${stats.frames} | loss ${loss.toFixed(1)}%${saturated ? " | saturated" : ""}`);
+  }
+}
+
+document.getElementById("btnConnect").addEventListener("click", connect);
+document.getElementById("btnStart").addEventListener("click", () => sendCmd(0x01));
+document.getElementById("btnStop").addEventListener("click", () => sendCmd(0x00));
+document.getElementById("btnRecord").addEventListener("click", toggleRecord);
+document.getElementById("btnDownload").addEventListener("click", downloadCsv);
+
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
