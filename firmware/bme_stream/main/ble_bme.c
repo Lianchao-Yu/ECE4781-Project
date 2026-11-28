@@ -30,10 +30,15 @@ static const ble_uuid128_t s_tx_uuid =
 static const ble_uuid128_t s_rx_uuid =
     BLE_UUID128_INIT(0x50, 0x4f, 0x3e, 0x2d, 0x1c, 0x0b, 0x77, 0x9a, 0x21, 0x4d, 0x4a, 0x3e, 0x02,
                      0x1c, 0x9b, 0x5f);
+static const ble_uuid128_t s_evt_uuid =
+    BLE_UUID128_INIT(0x50, 0x4f, 0x3e, 0x2d, 0x1c, 0x0b, 0x77, 0x9a, 0x21, 0x4d, 0x4a, 0x3e, 0x03,
+                     0x1c, 0x9b, 0x5f);
 
 static uint16_t s_tx_val_handle;
+static uint16_t s_evt_val_handle;
 static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static volatile bool s_subscribed;
+static volatile bool s_evt_subscribed;
 static volatile bool s_stream_enabled = true;
 static volatile bool s_synced;
 static volatile unsigned s_mtu;
@@ -59,6 +64,14 @@ static const struct ble_gatt_svc_def s_services[] = {
                     .uuid = &s_rx_uuid.u,
                     .access_cb = gatt_access,
                     .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                },
+                {
+                    /* Button/event channel, kept separate from the sample
+                     * stream so it never delays or perturbs the frames. */
+                    .uuid = &s_evt_uuid.u,
+                    .access_cb = gatt_access,
+                    .flags = BLE_GATT_CHR_F_NOTIFY,
+                    .val_handle = &s_evt_val_handle,
                 },
                 {0},
             },
@@ -123,6 +136,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "disconnected, reason=%d", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_subscribed = false;
+        s_evt_subscribed = false;
         s_mtu = 0;
         advertise();
         break;
@@ -131,6 +145,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->subscribe.attr_handle == s_tx_val_handle) {
             s_subscribed = event->subscribe.cur_notify;
             ESP_LOGI(TAG, "data subscription %s", s_subscribed ? "on" : "off");
+        } else if (event->subscribe.attr_handle == s_evt_val_handle) {
+            s_evt_subscribed = event->subscribe.cur_notify;
+            ESP_LOGI(TAG, "event subscription %s", s_evt_subscribed ? "on" : "off");
         }
         break;
 
@@ -284,4 +301,26 @@ bool ble_bme_notify(const void *data, size_t len)
     /* The stack takes ownership of om and frees it on both paths. */
     int rc = ble_gatts_notify_custom(s_conn_handle, s_tx_val_handle, om);
     return rc == 0;
+}
+
+void ble_bme_notify_button(uint32_t uptime_ms)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_evt_subscribed) {
+        return;
+    }
+
+    uint8_t pkt[BME_EVENT_PACKET_LEN] = {
+        BME_EVENT_VERSION,
+        BME_EVENT_BUTTON,
+        (uint8_t)(uptime_ms & 0xFF),
+        (uint8_t)((uptime_ms >> 8) & 0xFF),
+        (uint8_t)((uptime_ms >> 16) & 0xFF),
+        (uint8_t)((uptime_ms >> 24) & 0xFF),
+    };
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, sizeof(pkt));
+    if (om == NULL) {
+        return;
+    }
+    ble_gatts_notify_custom(s_conn_handle, s_evt_val_handle, om);
 }

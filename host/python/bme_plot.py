@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import csv
 import gc
 import math
+import queue
 import struct
 import sys
 import threading
@@ -27,7 +27,6 @@ from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -45,6 +44,8 @@ from bleak import BleakClient, BleakScanner
 SERVICE_UUID = "5f9b1c00-3e4a-4d21-9a77-0b1c2d3e4f50"
 TX_UUID = "5f9b1c01-3e4a-4d21-9a77-0b1c2d3e4f50"
 RX_UUID = "5f9b1c02-3e4a-4d21-9a77-0b1c2d3e4f50"
+EVENT_UUID = "5f9b1c03-3e4a-4d21-9a77-0b1c2d3e4f50"
+EVENT_BUTTON = 1
 DEVICE_NAME = "BME-S3"
 
 MAGIC = b"\xA5\x5A"
@@ -255,9 +256,10 @@ class BLERunner:
 
     RECONNECT_DELAY = 1.5
 
-    def __init__(self, decoder: Decoder, log) -> None:
+    def __init__(self, decoder: Decoder, log, on_event=None) -> None:
         self.decoder = decoder
         self.log = log
+        self.on_event = on_event
         self.loop = asyncio.new_event_loop()
         self.client: BleakClient | None = None
         self._want_stop = True
@@ -322,6 +324,12 @@ class BLERunner:
             self.decoder.reset_sequence()
 
             await client.start_notify(TX_UUID, self._on_notify)
+            if self.on_event is not None:
+                try:
+                    await client.start_notify(EVENT_UUID, self._on_event)
+                except Exception as exc:
+                    # Older firmware has no event channel: markers are optional.
+                    self.log(f"No event channel: {exc}")
             try:
                 await client.write_gatt_char(RX_UUID, CMD_START, response=False)
             except Exception as exc:  # the start command is optional
@@ -366,6 +374,15 @@ class BLERunner:
     def _on_notify(self, _char, data: bytearray) -> None:
         self.decoder.feed(bytes(data))
 
+    def _on_event(self, _char, data: bytearray) -> None:
+        """Button/event notification: 6 bytes, see BME_EVENT_PACKET_LEN."""
+        if len(data) < 6 or self.on_event is None:
+            return
+        version, kind = data[0], data[1]
+        uptime_ms = int.from_bytes(data[2:6], "little")
+        if version == 1 and kind == EVENT_BUTTON:
+            self.on_event(uptime_ms)
+
 
 # ---------------------------------------------------------------- plotting
 
@@ -397,6 +414,7 @@ class WavePane(QWidget):
         self._fs = 1000.0
         self._font = QFont("Segoe UI", 8)
         self._hover_x: float | None = None
+        self._markers: list[tuple[float, str]] = []
         self.setMouseTracking(True)
 
     # ---- configuration
@@ -433,6 +451,13 @@ class WavePane(QWidget):
         bottom = QRectF(plot.left(), plot.bottom(), plot.width(), self.BOTTOM)
         self.update(plot.toAlignedRect().united(bottom.toAlignedRect()))
 
+    def set_markers(self, markers: list[tuple[float, str]]) -> None:
+        """Event markers (absolute seconds). Repaints if the list changed, so a
+        marker still shows up while the view is paused."""
+        if markers != self._markers:
+            self._markers = markers
+            self.update()
+
     def _plot_rect(self) -> QRectF:
         return QRectF(
             self.LEFT,
@@ -460,10 +485,32 @@ class WavePane(QWidget):
 
     def _draw_cursor(self, p: QPainter, plot: QRectF, lo: float) -> None:
         """Vertical cursor with the exact time and value under the mouse."""
-        if self._hover_x is None or self._values.size < 2:
+        if self._hover_x is None:
             return
+
+        hit = self._marker_near(self._hover_x, plot)
+        if hit is not None:
+            t, label = hit
+            span = max(1e-9, self._t1 - self._t0)
+            x = plot.left() + (t - self._t0) / span * plot.width()
+            p.setPen(QPen(QColor(255, 179, 71, 255), 2))
+            p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+
+            text = f"{label} · t = {t:.2f} s"
+            metrics = p.fontMetrics()
+            width = metrics.horizontalAdvance(text) + 12
+            x0 = min(max(x - width / 2, plot.left() + 4), plot.right() - width - 4)
+            box = QRectF(x0, plot.top() + 6, width, 18)
+            p.fillRect(box, QColor(0, 0, 0, 190))
+            p.setPen(QColor(255, 179, 71))
+            p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
+            return
+
         frac = (self._hover_x - plot.left()) / plot.width()
         t = self._t0 + frac * (self._t1 - self._t0)
+
+        if self._values.size < 2:
+            return
 
         # Nearest sample of the drawn trace.
         idx = int(round((t - self._start_s) * self._fs))
@@ -482,6 +529,43 @@ class WavePane(QWidget):
         p.fillRect(box, QColor(0, 0, 0, 160))
         p.setPen(AXIS_COLOR)
         p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
+
+    def _marker_near(self, x: float, plot: QRectF) -> tuple[float, str] | None:
+        """Return the marker whose line is within a few pixels of `x`."""
+        span = max(1e-9, self._t1 - self._t0)
+        best = None
+        for t, label in self._markers:
+            if t < self._t0 or t > self._t1:
+                continue
+            mx = plot.left() + (t - self._t0) / span * plot.width()
+            dist = abs(mx - x)
+            if dist <= 6.0 and (best is None or dist < best[0]):
+                best = (dist, t, label)
+        return (best[1], best[2]) if best is not None else None
+
+    def _draw_markers(self, p: QPainter, plot: QRectF) -> None:
+        """Amber dashed lines behind the trace; the curve always stays on top."""
+        if not self._markers:
+            return
+        span = max(1e-9, self._t1 - self._t0)
+        for t, _label in self._markers:
+            if t < self._t0 or t > self._t1:
+                continue
+            x = plot.left() + (t - self._t0) / span * plot.width()
+
+            p.setPen(QPen(QColor(255, 179, 71, 190), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+
+            # Small flag at the top so the marker is obvious but does not cover
+            # the waveform.
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 179, 71, 220))
+            p.drawPolygon(QPolygonF([
+                QPointF(x - 4, plot.top()),
+                QPointF(x + 4, plot.top()),
+                QPointF(x, plot.top() + 6),
+            ]))
+            p.setBrush(Qt.BrushStyle.NoBrush)
 
     # ---- painting
 
@@ -592,17 +676,17 @@ class WavePane(QWidget):
             self._draw_chrome(p, plot, lo, hi)
 
         values = self._values
-        if values.size < 2:
-            p.end()
-            return
+        if values.size >= 2:
+            p.save()
+            p.setClipRect(plot.intersected(dirty))
+            if values.size >= plot.width():
+                self._draw_envelope(p, plot, lo)
+            else:
+                self._draw_polyline(p, plot, lo)
+            p.restore()
 
-        p.save()
-        p.setClipRect(plot.intersected(dirty))
-        if values.size >= plot.width():
-            self._draw_envelope(p, plot, lo)
-        else:
-            self._draw_polyline(p, plot, lo)
-        p.restore()
+        # Markers go on top of the grid but under the hover readout.
+        self._draw_markers(p, plot)
 
         self._draw_cursor(p, plot, lo)
         p.end()
@@ -687,12 +771,10 @@ class MainWindow(QMainWindow):
 
         self.bufs = Buffers()
         self.decoder = Decoder(self.bufs)
-        self.ble = BLERunner(self.decoder, self._log)
-
-        self.records: list[tuple[float, ...]] = []
-        self.recording = False
-        self.t0 = time.monotonic()
-        self._last_frames = 0
+        self.ble = BLERunner(self.decoder, self._log, on_event=self._on_button_event)
+        # Event markers: absolute time in seconds + label, shared by the panes.
+        self._markers: list[tuple[float, str]] = []
+        self._marker_q: "queue.Queue[float]" = queue.Queue()
 
         self.window_s = 5.0
         self.detail = 16
@@ -725,11 +807,8 @@ class MainWindow(QMainWindow):
         self.btn_disconnect = QPushButton("Disconnect")
         self.btn_stop = QPushButton("Stop sampling")
         self.btn_stop.setCheckable(True)
-        self.btn_record = QPushButton("Start recording")
         self.btn_clear = QPushButton("Clear")
-        self.btn_save = QPushButton("Save CSV")
-        for b in (self.btn_connect, self.btn_disconnect, self.btn_stop,
-                  self.btn_record, self.btn_clear, self.btn_save):
+        for b in (self.btn_connect, self.btn_disconnect, self.btn_stop, self.btn_clear):
             bar.addWidget(b)
         self.status = QLabel("Not connected")
         # A fixed width keeps the toolbar from re-laying out whenever the
@@ -799,9 +878,7 @@ class MainWindow(QMainWindow):
         # ---- signals
         self.btn_connect.clicked.connect(self.ble.connect)
         self.btn_disconnect.clicked.connect(self.ble.disconnect)
-        self.btn_record.clicked.connect(self._toggle_record)
         self.btn_clear.clicked.connect(self._clear)
-        self.btn_save.clicked.connect(self._save_csv)
         self.btn_latest.clicked.connect(lambda: self.slider.setValue(1000))
         self.slider.valueChanged.connect(self._on_slider)
         self.btn_center.clicked.connect(self._center_now)
@@ -920,17 +997,31 @@ class MainWindow(QMainWindow):
         self.status.setText(msg)
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-    def _toggle_record(self) -> None:
-        if self.recording:
-            self.recording = False
-            self.btn_record.setText("Start recording")
-            self._log(f"Recording stopped, {len(self.records)} samples")
-        else:
-            self.records.clear()
-            self.t0 = time.monotonic()
-            self.recording = True
-            self.btn_record.setText("Stop recording")
-            self._log("Recording started")
+    def _on_button_event(self, uptime_ms: int) -> None:
+        """Called from the BLE thread when the device reports a button press.
+
+        The device uptime is useful for logging, but the marker has to land on
+        the sample timeline, so anchor it to the current sample counter. BLE
+        latency shifts it by a few milliseconds at most.
+        """
+        index = self.bufs.emg.total
+        self._marker_q.put(index / EMG_FS)
+        print(f"[{time.strftime('%H:%M:%S')}] button press (device {uptime_ms} ms)", flush=True)
+
+    def _drain_markers(self, latest_s: float) -> None:
+        """Move queued presses into the marker list and drop expired ones."""
+        while True:
+            try:
+                t = self._marker_q.get_nowait()
+            except queue.Empty:
+                break
+            self._markers.append((t, "Button pressed"))
+
+        oldest = latest_s - HISTORY_S - 2.0
+        if self._markers and self._markers[0][0] < oldest:
+            self._markers = [m for m in self._markers if m[0] >= oldest]
+        if len(self._markers) > 200:
+            self._markers = self._markers[-200:]
 
     def _playhead_s(self, latest_s: float) -> float:
         """Smoothly advancing playback position, in seconds.
@@ -984,30 +1075,20 @@ class MainWindow(QMainWindow):
 
     def _clear(self) -> None:
         self.bufs.clear()
-        self.records.clear()
-        self._last_frames = 0
         self._centers = {"emg": None, "ppg": None, "eda": None}
         self._spans = {key: BASE_SPAN_MV for key in self.panes}
         self._applied = {key: (None, None) for key in self.panes}
+        self._markers.clear()
+        while not self._marker_q.empty():
+            try:
+                self._marker_q.get_nowait()
+            except queue.Empty:
+                break
         self._paused = False
         self._play_last_t = None
         self._play_pos = 0.0
         self._rate_est = EMG_FS
         self.slider.setValue(1000)
-
-    def _save_csv(self) -> None:
-        if not self.records:
-            self._log("No data to save")
-            return
-        default = f"bme_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", default, "CSV (*.csv)")
-        if not path:
-            return
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["time_s", "emg_counts", "ppg_counts", "eda_counts"])
-            writer.writerows(self.records)
-        self._log(f"Saved {len(self.records)} rows to {path}")
 
     # ---- data access
 
@@ -1158,6 +1239,10 @@ class MainWindow(QMainWindow):
         else:
             t0, t1 = end_s - self.window_s, end_s
 
+        self._drain_markers(latest_s)
+        for pane in self.panes.values():
+            pane.set_markers(self._markers)
+
         # ---- fetch one window per channel and apply the fixed Y levels
         views = {}
         starts = {}
@@ -1178,29 +1263,13 @@ class MainWindow(QMainWindow):
             values, fs_eff, start_s = self._prepare_trace(values, starts[key], fs, key)
             pane.set_trace(values * MV_PER_COUNT, fs_eff, start_s)
 
-        # ---- recording (raw counts, 1 ms rows for EMG)
+        # ---- status line
         with self.bufs.lock:
             frames = self.bufs.frames
             bench = self.bufs.bench
             saturated = self.bufs.saturated
             rate = self.bufs.emg_rate
             lost = self.bufs.lost
-        new_frames = frames - self._last_frames
-        self._last_frames = frames
-
-        if self.recording and new_frames > 0:
-            with self.bufs.lock:
-                n_new = min(new_frames * 10, self.bufs.emg.count)
-                emg_new = self.bufs.emg.tail(n_new).copy()
-                ppg_last = float(self.bufs.ppg.tail(1)[0]) if self.bufs.ppg.count else 0.0
-                eda_last = float(self.bufs.eda.tail(1)[0]) if self.bufs.eda.count else 0.0
-            now = time.monotonic() - self.t0
-            dt = 1.0 / EMG_FS
-            base = now - len(emg_new) * dt
-            self.records.extend(
-                (round(base + i * dt, 4), float(v), ppg_last, eda_last)
-                for i, v in enumerate(emg_new)
-            )
 
         if frames:
             now = time.monotonic()

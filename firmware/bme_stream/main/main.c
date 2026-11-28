@@ -113,10 +113,10 @@ void app_main(void)
     ESP_LOGI(TAG, "acquisition source: internal ADC (%s)",
              sensor_bench_mode() ? "bench mode, inputs floating" : "sensors connected");
 
-    /* Audio add-on: I2S amplifier + button, wired up by its own module. */
-    audio_control_init();
-
+    /* Audio add-on: I2S amplifier + button. The press is forwarded to the BLE
+     * layer through a callback, so the audio module stays independent. */
     ble_bme_init();
+    audio_control_init(ble_bme_notify_button);
 
     /* Sampling runs on core 1; the BLE host task stays on core 0. */
     BaseType_t ok = xTaskCreatePinnedToCore(sample_task, "sampler", 4096, NULL, 6, NULL, 1);

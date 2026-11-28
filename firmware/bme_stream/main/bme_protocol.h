@@ -54,7 +54,17 @@ _Static_assert(sizeof(bme_frame_t) == 31, "bme_frame_t must stay 31 bytes");
 #define BME_SERVICE_UUID_STR "5f9b1c00-3e4a-4d21-9a77-0b1c2d3e4f50"
 #define BME_TX_UUID_STR "5f9b1c01-3e4a-4d21-9a77-0b1c2d3e4f50"
 #define BME_RX_UUID_STR "5f9b1c02-3e4a-4d21-9a77-0b1c2d3e4f50"
+#define BME_EVENT_UUID_STR "5f9b1c03-3e4a-4d21-9a77-0b1c2d3e4f50"
 #define BME_DEVICE_NAME "BME-S3"
+
+/* ---------- Event packet (notify on the event characteristic) ----------
+ *   [0] version (1)
+ *   [1] event type: 1 = button pressed
+ *   [2..5] device uptime in milliseconds, little endian
+ */
+#define BME_EVENT_VERSION 1
+#define BME_EVENT_BUTTON 1
+#define BME_EVENT_PACKET_LEN 6
 
 /* ---------- Command bytes written to the RX characteristic ---------- */
 #define BME_CMD_STOP 0x00

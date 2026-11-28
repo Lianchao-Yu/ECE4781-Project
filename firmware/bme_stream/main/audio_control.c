@@ -5,8 +5,10 @@
 #include "board_config.h"
 #include "button.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "audio_control";
+static audio_press_cb_t s_on_press;
 
 static void on_button_press(void *arg)
 {
@@ -18,10 +20,18 @@ static void on_button_press(void *arg)
     }
     /* Restarts from the start if it is already playing. */
     audio_player_play(clip);
+
+    /* Report the press after starting playback so the sound is not delayed by
+     * a slow subscriber. */
+    if (s_on_press != NULL) {
+        s_on_press((uint32_t)(esp_timer_get_time() / 1000));
+    }
 }
 
-void audio_control_init(void)
+void audio_control_init(audio_press_cb_t on_press)
 {
+    s_on_press = on_press;
+
     ESP_ERROR_CHECK(audio_player_init());
     ESP_ERROR_CHECK(button_init(BUTTON_GPIO, on_button_press, NULL));
 

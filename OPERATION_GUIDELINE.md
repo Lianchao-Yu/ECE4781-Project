@@ -1,4 +1,4 @@
-# Operation Guideline
+﻿# Operation Guideline
 
 Quick operating logic for the BME acquisition board (ESP32-S3) and its PC
 viewer. Hardware details and the protocol live in `README.md` and
@@ -35,7 +35,7 @@ and moving it to a power bank needs no manual action.
 
 | Control | Action |
 |---|---|
-| Button (GPIO18 to GND) | plays the notification clip; pressing again restarts it |
+| Button (GPIO18 to GND) | plays the notification clip and marks the moment in the viewer; pressing again restarts it |
 
 There is no power switch and no other on-device control. The board keeps
 sampling and advertising until power is removed.
@@ -46,9 +46,8 @@ sampling and advertising until power is removed.
 |---|---|
 | Connect / Disconnect | open or close the BLE link |
 | Stop sampling | asks the device to stop streaming; the link stays up. Press again (`Resume sampling`) to continue |
-| Start recording | stores incoming samples for CSV export |
-| Clear | empties the buffers, the 60 s history and the recording |
-| Save CSV | writes the recording (`time_s, emg_counts, ppg_counts, eda_counts`) |
+| Clear | empties the buffers and the 60 s history |
+| Event markers | every button press draws an amber dashed line at that time; hover it to read `Button pressed · t = x.xx s` |
 | Window | visible time span: 1, 2, 5, 10 or 30 s |
 | Detail | display decimation: Full, 1/2 … 1/32 (1/16 default). Affects the 1 kHz EMG stream; PPG/EDA are capped at 50 Hz |
 | Zoom | requested magnification. Each pane is clamped to fit its own signal, so a trace never leaves the view |
@@ -70,11 +69,6 @@ labels advance as the stream runs.
 **Review the last minute**
 1. Drag the slider left; the view freezes at that moment.
 2. Drag right, or press `Latest`, to resume live.
-
-**Record a session**
-1. Press `Start recording`.
-2. Press it again to stop, then `Save CSV`.
-   Recording keeps running while the view is paused.
 
 **Restart the board**
 Unplug and re-power. The viewer reconnects in about two seconds and the

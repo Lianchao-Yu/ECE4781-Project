@@ -1,13 +1,14 @@
 # Project-BME
 
 ESP32-S3 firmware that samples three biomedical channels (EMG / PPG / EDA) and
-streams them over BLE, plus two PC viewers that plot and record the data.
+streams them over BLE, plus two PC viewers that plot the data live.
 
 ```
 firmware/bme_stream/   ESP-IDF firmware (NimBLE GATT, ~100 frames/s)
-host/python/           desktop viewer (bleak + pyqtgraph), CSV recording, link self-test
+host/python/           desktop viewer (PyQt6, custom painter), link self-test
 host/web/              browser viewer (Web Bluetooth), no installation
 docs/PROTOCOL.md       BLE protocol and frame layout
+OPERATION_GUIDELINE.md day-to-day operating checklist
 ```
 
 ## Hardware and pin usage
@@ -41,7 +42,7 @@ Electrical limits:
 
 Bench mode (default): the pins are left **floating**, so every reading is the
 random value a floating ADC input produces. That is enough to prove the whole
-chain — BLE link, frame rate, host plotting, CSV — without any sensor. Disable
+chain — BLE link, frame rate, host plotting — without any sensor. Disable
 `BME_BENCH_MODE` in menuconfig once the electrodes are wired, so the host stops
 labelling the data as `bench`.
 
@@ -102,6 +103,12 @@ the clip from the start; pressing again restarts it. The button is debounced in
 software (30 ms) and one press produces exactly one event, holding it does not
 repeat.
 
+Each press is also reported to the host over a dedicated event characteristic
+(`...1c03`), separately from the sample stream. The desktop viewer draws an
+amber dashed line at that instant, scrolling with the waveform; hovering the
+line shows `Button pressed · t = 12.34 s`. Markers are kept for the 60 s of
+buffered history and cleared by `Clear`.
+
 The audio code is split so each part can be changed alone:
 
 | File | Responsibility |
@@ -138,7 +145,7 @@ Command-line link check (prints frame rate, loss, per-channel ranges):
 & F:\Espressif\venvs\bme-host\Scripts\python.exe host\python\ble_selftest.py
 ```
 
-Desktop viewer with zoom and CSV export:
+Desktop viewer with live plots, history scrubbing and event markers:
 
 ```powershell
 host\run_host.ps1
@@ -197,8 +204,7 @@ the view freezes at that moment (the label shows `[PAUSED]`) while acquisition
 and buffering continue; moving it back to the right resumes live drawing.
 
 Axes carry units: time in seconds, amplitude in millivolts. The conversion from
-raw counts is `mV = counts * 3.1 / 4095 / 8`, so 1 count ≈ 0.095 mV. CSV files
-keep the raw counts so nothing is lost.
+raw counts is `mV = counts * 3.1 / 4095 / 8`, so 1 count ≈ 0.095 mV.
 
 ## Display performance
 

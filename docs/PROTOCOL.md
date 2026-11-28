@@ -10,6 +10,7 @@ Device name: `BME-S3`
 | Service | `5f9b1c00-3e4a-4d21-9a77-0b1c2d3e4f50` | primary |
 | Data stream | `5f9b1c01-3e4a-4d21-9a77-0b1c2d3e4f50` | notify |
 | Commands | `5f9b1c02-3e4a-4d21-9a77-0b1c2d3e4f50` | write, write-no-response |
+| Events | `5f9b1c03-3e4a-4d21-9a77-0b1c2d3e4f50` | notify |
 
 ## Sample rates
 
@@ -58,7 +59,6 @@ def feed(data):
 ```
 
 ## Commands
-
 Write one byte to the command characteristic (`...1c02`):
 
 | Value | Meaning |
@@ -66,6 +66,25 @@ Write one byte to the command characteristic (`...1c02`):
 | `0x00` | stop streaming |
 | `0x01` | start streaming (default after boot) |
 | `0x02` | WHOAMI (logs a line on the device) |
+
+## Event packets
+
+The event characteristic (`...1c03`) carries short notifications that are not
+part of the sample stream, so a button press never disturbs a frame. Currently
+only one event exists: the user pressed the button.
+
+| Offset | Size | Type | Field | Description |
+|---|---|---|---|---|
+| 0 | 1 | uint8 | version | `0x01` |
+| 1 | 1 | uint8 | type | `0x01` = button pressed |
+| 2 | 4 | uint32 | uptime_ms | device uptime at the press, little endian |
+
+The packet is 6 bytes. The device only sends it when a central is subscribed to
+the event characteristic; older firmware simply does not expose it.
+
+Hosts place the marker on their own sample timeline: when the notification
+arrives, record the current absolute sample index. BLE latency adds only a few
+milliseconds of offset, which is below one pixel at normal zoom.
 
 ## MTU requirement
 
