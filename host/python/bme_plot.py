@@ -788,6 +788,8 @@ class MainWindow(QMainWindow):
         self._paused = False
         self._paused_end_s = 0.0
         self._fitting = False
+        self._device_stopped = False
+        self._last_latest_s = 0.0
         # Playback clock: the head advances at the measured sample rate and
         # stays a little behind the newest sample, so bursty BLE delivery does
         # not turn into stop-and-jump motion on screen.
@@ -918,14 +920,24 @@ class MainWindow(QMainWindow):
         self._autofit()
 
     def _toggle_sampling(self, stopped: bool) -> None:
-        """Stop/resume the device stream without dropping the BLE link.
+        """Stop/resume the device stream without closing anything.
 
-        The firmware treats 0x00 as "stop notifications" and 0x01 as "start";
-        the connection stays up, so resuming is instant.
+        The link, the window and the buffered history stay alive; only new
+        samples stop arriving. Pressing the button again resumes the stream.
         """
+        self._device_stopped = stopped
         self.ble.send_command(CMD_STOP if stopped else CMD_START)
         self.btn_stop.setText("Resume sampling" if stopped else "Stop sampling")
-        self._log("Sampling stopped" if stopped else "Sampling resumed")
+
+        if stopped:
+            # Freeze the playback head where it is so the trace stops on the
+            # next frame instead of drifting to the end of the buffer.
+            latest = self.bufs.emg.total
+            self._play_pos = max(0.0, latest - self.PLAY_MARGIN_S * EMG_FS)
+            self._play_last_t = None  # re-anchor from here when resuming
+            self._log("Sampling stopped, press Resume to continue")
+        else:
+            self._log("Sampling resumed")
 
     def _on_slider(self, value: int) -> None:
         """Right end = live; any other position freezes the view there."""
@@ -1205,10 +1217,27 @@ class MainWindow(QMainWindow):
     def _refresh_frame(self) -> None:
         latest_s = self.bufs.emg.total / EMG_FS
 
+        # If samples keep arriving while the button says "stopped", the device
+        # was restarted or reconnected: resync the button instead of lying.
+        if self._device_stopped and latest_s > self._last_latest_s + 0.2:
+            self._device_stopped = False
+            self.btn_stop.blockSignals(True)
+            self.btn_stop.setChecked(False)
+            self.btn_stop.blockSignals(False)
+            self.btn_stop.setText("Stop sampling")
+        self._last_latest_s = latest_s
+
         # ---- where to look: live playhead or a frozen history position
         # The slider is a timeline: far right is live, dragging left freezes
         # the view at that moment while acquisition keeps running.
-        end_s = min(self._paused_end_s, latest_s) if self._paused else self._playhead_s(latest_s)
+        if self._paused:
+            end_s = min(self._paused_end_s, latest_s)
+        elif self._device_stopped:
+            # No new samples: hold the frozen position exactly, without letting
+            # the playhead advance to the end of the buffered data.
+            end_s = self._play_pos / EMG_FS
+        else:
+            end_s = self._playhead_s(latest_s)
         # Never ask for a window that reaches further back than the buffer.
         history = self.bufs.emg.count / EMG_FS
         oldest_end = max(0.0, latest_s - max(0.0, history - self.window_s))
@@ -1227,6 +1256,8 @@ class MainWindow(QMainWindow):
         delay = max(0.0, latest_s - end_s)
         if self._paused:
             text = f"Delay: {delay:5.1f} s  [PAUSED]"
+        elif self._device_stopped:
+            text = "Sampling stopped"
         else:
             text = "Live"
         if self.delay_label.text() != text:
@@ -1279,8 +1310,9 @@ class MainWindow(QMainWindow):
             loss_pct = 100.0 * lost / max(1, frames + lost)
             mode = "bench" if bench else "live"
             sat_text = " | saturated" if saturated else ""
+            stop_text = " | stopped" if self._device_stopped else ""
             self.status.setText(
-                f"{mode} | {rate:5.0f} Hz | frames {frames} | loss {loss_pct:4.1f}%{sat_text}"
+                f"{mode} | {rate:5.0f} Hz | frames {frames} | loss {loss_pct:4.1f}%{sat_text}{stop_text}"
             )
 
     def closeEvent(self, event) -> None:

@@ -45,7 +45,7 @@ sampling and advertising until power is removed.
 | Control | Function |
 |---|---|
 | Connect / Disconnect | open or close the BLE link |
-| Stop sampling | asks the device to stop streaming; the link stays up. Press again (`Resume sampling`) to continue |
+| Stop sampling | stops acquisition on the device; the program, the window and the buffered history stay alive. The status shows `Sampling stopped`, the trace freezes and the slider still browses history. Press `Resume sampling` to continue |
 | Clear | empties the buffers and the 60 s history |
 | Event markers | every button press draws an amber dashed line at that time; hover it to read `Button pressed · t = x.xx s` |
 | Window | visible time span: 1, 2, 5, 10 or 30 s |
