@@ -82,6 +82,54 @@ idf.py -B F:\Espressif\builds\bme_stream -p COM3 flash monitor
 > `F:\py12\Lib\site-packages` used to leak global packages into the ESP-IDF
 > virtual environment and broke the dependency check, so it was removed.
 
+## Audio: MAX98357A + button
+
+A press on the button plays `notify.wav` through a MAX98357A I2S amplifier.
+
+| MAX98357A | ESP32-S3 | Notes |
+|---|---|---|
+| VIN | 5V | a 3 W amp can brown out the USB rail; a separate 5 V supply with common GND is safer |
+| GND | GND | |
+| BCLK | GPIO15 | bit clock |
+| LRC | GPIO16 | word select |
+| DIN | GPIO17 | data |
+| SD | 3V3 or floating | 3V3 = left channel, floating = (L+R)/2 |
+| GAIN | floating | 9 dB |
+| + / − | speaker | 4 Ω, 3 W |
+
+Button: `GPIO18` to `GND`, the internal pull-up is enabled. One press plays
+the clip from the start; pressing again restarts it. The button is debounced in
+software (30 ms) and one press produces exactly one event, holding it does not
+repeat.
+
+The audio code is split so each part can be changed alone:
+
+| File | Responsibility |
+|---|---|
+| `main/board_config.h` | pins, volume, debounce time — re-wiring only touches this |
+| `main/audio_player.c/.h` | I2S channel, chunked playback, abort/restart |
+| `main/audio_clip.c/.h` | parses the embedded WAV into PCM samples |
+| `main/button.c/.h` | GPIO interrupt, debounce, press callback |
+| `main/audio_control.c/.h` | decides that a press means "play the clip" |
+| `main/notify.wav` | the sound itself, baked into the image by `EMBED_FILES` |
+
+To change the sound, replace `main/notify.wav` with any **16 kHz, 16-bit,
+mono PCM** WAV and rebuild. No code changes are needed; the parser validates
+the header and logs an error if the format does not match.
+
+For a wiring check without touching the button, enable
+`BME_AUDIO_TEST_ON_BOOT` in `menuconfig → BME acquisition`: the clip plays once
+at boot and the serial log shows `play ... / clip finished`.
+
+```powershell
+. F:\Espressif\idf.ps1
+cd firmware\bme_stream
+idf.py -B F:\Espressif\builds\bme_stream build flash
+```
+
+`main.c` only calls `audio_control_init()`; everything else lives in the
+modules above.
+
 ## PC applications
 
 Command-line link check (prints frame rate, loss, per-channel ranges):

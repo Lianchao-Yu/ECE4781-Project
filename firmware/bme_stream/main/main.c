@@ -9,6 +9,7 @@
 
 #include "bme_protocol.h"
 #include "ble_bme.h"
+#include "audio_control.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -111,6 +112,9 @@ void app_main(void)
     sensor_init();
     ESP_LOGI(TAG, "acquisition source: internal ADC (%s)",
              sensor_bench_mode() ? "bench mode, inputs floating" : "sensors connected");
+
+    /* Audio add-on: I2S amplifier + button, wired up by its own module. */
+    audio_control_init();
 
     ble_bme_init();
 

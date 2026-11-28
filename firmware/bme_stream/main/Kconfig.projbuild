@@ -32,4 +32,11 @@ menu "BME acquisition"
             check. The flag is reported in every frame so the PC can label
             the data as bench instead of live.
 
+    config BME_AUDIO_TEST_ON_BOOT
+        bool "Play the notification clip once at boot (audio hardware check)"
+        default n
+        help
+            Plays notify.wav as soon as the audio module is initialised, so the
+            amplifier and speaker can be checked without pressing the button.
+
 endmenu

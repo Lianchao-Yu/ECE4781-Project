@@ -48,6 +48,8 @@ RX_UUID = "5f9b1c02-3e4a-4d21-9a77-0b1c2d3e4f50"
 DEVICE_NAME = "BME-S3"
 
 MAGIC = b"\xA5\x5A"
+# Wire format, little endian, fixed at 31 bytes:
+#   magic(2) version(1) flags(1) seq(2) n_emg(1) emg[10](20) ppg(2) eda(2)
 FRAME = struct.Struct("<BBBBHB10h2h")
 assert FRAME.size == 31
 
@@ -59,7 +61,11 @@ EDA_FS = 100.0
 HISTORY_S = 60.0
 
 WINDOW_CHOICES = [1, 2, 5, 10, 30]
+# Detail is the decimation applied to the 1 kHz EMG stream. Slower channels
+# are scaled accordingly so 1/16 does not turn 100 Hz data into 6 Hz.
 DETAIL_CHOICES = [("Full", 1), ("1/2", 2), ("1/4", 4), ("1/8", 8), ("1/16", 16), ("1/32", 32)]
+# Requested magnification. Per-pane spans are clamped to fit their own signal,
+# so a high value never pushes a trace out of the view.
 ZOOM_CHOICES = [("1x", 1.0), ("2x", 2.0), ("5x", 5.0), ("10x", 10.0), ("20x", 20.0)]
 
 # Nominal Y span at 1x, in millivolts. 1x covers the ADC full scale, so nothing
@@ -125,7 +131,13 @@ class Ring:
         self.total += n
 
     def tail(self, n: int, offset: int = 0) -> np.ndarray:
-        """Return the newest n samples that end `offset` samples before the head."""
+        """Return the newest `n` samples ending `offset` samples before the head.
+
+        `offset` is measured in samples from the newest one, which is how the
+        history slider walks backwards. The result may be shorter than `n` when
+        the ring has not filled up yet or the request reaches past the oldest
+        buffered sample.
+        """
         available = self.count - offset
         if available <= 0:
             return np.empty(0, np.float32)
@@ -133,7 +145,9 @@ class Ring:
         end = (self.head - offset) % self.size
         start = (end - n) % self.size
         if start < end:
+            # Contiguous slice, no copy.
             return self.buf[start:end]
+        # Wrapped around the end of the buffer: stitch the two halves in order.
         return np.concatenate((self.buf[start:], self.buf[:end]))
 
 
@@ -177,8 +191,10 @@ class Decoder:
         self.rate_samples = 0
 
     def feed(self, data: bytes) -> None:
+        """Consume one BLE notification; may contain a frame split, or garbage."""
         self.buf += data
         while True:
+            # Resynchronise on the magic word rather than trusting the stream.
             idx = self.buf.find(MAGIC)
             if idx < 0:
                 # Keep the last byte: it may be the first half of a magic word.
@@ -209,6 +225,8 @@ class Decoder:
                 self.bufs.ppg.push(ppg)
                 self.bufs.eda.push(eda)
 
+            # Rate is averaged over at least one second; individual
+            # notification spacing is far too bursty to use directly.
             self.rate_samples += n_emg
             now = time.monotonic()
             dt = now - self.rate_t0
@@ -270,6 +288,7 @@ class BLERunner:
             pass
 
     async def _connect_loop(self) -> None:
+        """Keep scanning until connected, so a power cycle reconnects by itself."""
         while not self._want_stop:
             if await self._try_connect():
                 return
@@ -278,8 +297,11 @@ class BLERunner:
             await asyncio.sleep(self.RECONNECT_DELAY)
 
     async def _try_connect(self) -> bool:
+        """One scan + connect attempt. Returns True when notifications started."""
         try:
             def is_target(dev, adv):
+                # The name lives in the scan response, which Windows normally
+                # merges; the service UUID is a fallback for adapters that do not.
                 name = adv.local_name or dev.name or ""
                 if name.startswith(DEVICE_NAME):
                     return True
@@ -296,6 +318,7 @@ class BLERunner:
             client = BleakClient(device, disconnected_callback=self._on_disconnect)
             await client.connect()
             self.client = client
+            # New session: seq restarts at 0, do not count that as packet loss.
             self.decoder.reset_sequence()
 
             await client.start_notify(TX_UUID, self._on_notify)
@@ -531,12 +554,15 @@ class WavePane(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.fillRect(event.rect(), BG_COLOR)
 
+        # Only the dirty rectangle is repainted; `dirty` decides which labels
+        # have to be redrawn as well (see below).
         dirty = QRectF(event.rect())
         plot = self._plot_rect()
         lo = self._center - self._span / 2.0
         hi = self._center + self._span / 2.0
 
-        # Grid lines live inside the plot area; they are cheap to redraw.
+        # Grid lines live inside the plot area; they move with the time axis so
+        # they are cheap enough to redraw every frame.
         p.save()
         p.setClipRect(plot.intersected(dirty))
         p.setPen(QPen(GRID_COLOR, 1))
@@ -554,8 +580,9 @@ class WavePane(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 40), 1))
         p.drawRect(plot)
 
-        # Labels move with time, so the bottom strip is refreshed every frame;
-        # the Y labels and title only when their areas are actually dirty.
+        # Time labels move with the stream, so their strip is refreshed every
+        # frame; the Y labels, axis titles and panel title only when their own
+        # areas are dirty (they would otherwise force a full relayout).
         bottom_strip = QRectF(0, plot.bottom(), self.width(), self.BOTTOM)
         if dirty.intersects(bottom_strip):
             self._draw_x_labels(p, plot)
@@ -615,7 +642,9 @@ class WavePane(QWidget):
         ix = ix[keep]
         iy = iy[keep]
 
-        # ix is non-decreasing because the samples are in time order.
+        # ix is non-decreasing because the samples are in time order, so the
+        # bin boundaries are just the positions where the column index changes;
+        # reduceat then gives min/max per column in one vectorised pass.
         starts = np.concatenate(([0], np.flatnonzero(np.diff(ix)) + 1))
         cols = ix[starts]
         ymin = np.minimum.reduceat(iy, starts)
@@ -628,6 +657,8 @@ class WavePane(QWidget):
             ymin[1:] = np.minimum(ymin[1:], prev_max)
             ymax[1:] = np.maximum(ymax[1:], prev_min)
 
+        # One vertical segment per column: ~1000 QLineF instead of one QPointF
+        # per sample (tens of thousands), which is the whole point of this path.
         left = plot.left()
         lines = [
             QLineF(left + cols[i] + 0.5, ymin[i], left + cols[i] + 0.5, ymax[i] + 1)
@@ -810,7 +841,11 @@ class MainWindow(QMainWindow):
         self._autofit()
 
     def _toggle_sampling(self, stopped: bool) -> None:
-        """Stop/resume the device stream without dropping the BLE link."""
+        """Stop/resume the device stream without dropping the BLE link.
+
+        The firmware treats 0x00 as "stop notifications" and 0x01 as "start";
+        the connection stays up, so resuming is instant.
+        """
         self.ble.send_command(CMD_STOP if stopped else CMD_START)
         self.btn_stop.setText("Resume sampling" if stopped else "Stop sampling")
         self._log("Sampling stopped" if stopped else "Sampling resumed")
@@ -898,12 +933,20 @@ class MainWindow(QMainWindow):
             self._log("Recording started")
 
     def _playhead_s(self, latest_s: float) -> float:
-        """Smoothly advancing playback position, in seconds."""
+        """Smoothly advancing playback position, in seconds.
+
+        Windows delivers BLE notifications in bursts (measured p95 gap ~58 ms,
+        max ~118 ms) even though the average is 100 frames/s. Drawing the
+        newest sample directly therefore produced stop-and-jump motion. The
+        playhead walks forward at the measured sample rate, roughly 0.3-0.5 s
+        behind the newest sample, so the bursts are absorbed by that buffer.
+        """
         latest_index = latest_s * EMG_FS
         now = time.monotonic()
         margin = self.PLAY_MARGIN_S * EMG_FS
 
         if self._play_last_t is None:
+            # First frame: start exactly one margin behind.
             self._play_last_t = now
             self._play_pos = max(0.0, latest_index - margin)
             self._rate_hist.append((now, latest_index))
@@ -978,16 +1021,26 @@ class MainWindow(QMainWindow):
         """
         fs = {"emg": EMG_FS, "ppg": PPG_FS, "eda": EDA_FS}[key]
         ring = getattr(self.bufs, key)
+        # Clamp to what has actually been received: during the first seconds,
+        # or when paused near the oldest sample, the request is longer than the
+        # buffer and tail() returns a shorter array.
         end_index = min(int(round(end_s * fs)), ring.total)
         start_index = max(0, end_index - int((self.window_s + margin_s) * fs))
         n = end_index - start_index
         with self.bufs.lock:
             values = ring.tail(n, ring.total - end_index)
+        # Report the real time of the first returned sample so the renderer's
+        # x mapping stays correct even when the window was clamped.
         return values, (end_index - values.size) / fs
 
     def _prepare_trace(self, values: np.ndarray, start_s: float, fs: float,
                        key: str) -> tuple[np.ndarray, float, float]:
-        """Smooth, decimate and align one channel for drawing."""
+        """Turn one raw window into the samples that will be drawn.
+
+        Pipeline: optional EDA smoothing -> per-channel decimation factor ->
+        align the first sample to the absolute bin grid -> average each bin.
+        Returns (values, effective_sample_rate, time_of_first_sample).
+        """
         if values.size < 2:
             return values, fs, start_s
 
@@ -1004,7 +1057,7 @@ class MainWindow(QMainWindow):
         scale = max(1, int(round(EMG_FS / fs)))
         factor = max(1, self.detail // scale)
         if key != "emg":
-            # 100 Hz channels carry no useful content above ~25 Hz; keeping
+            # 100 Hz channels carry no useful content above ~50 Hz; keeping
             # fewer points matters far more for painting cost than fidelity.
             factor = max(factor, int(math.ceil(fs / 50.0)))
         if factor <= 1 or values.size <= factor * 2:
@@ -1032,7 +1085,13 @@ class MainWindow(QMainWindow):
         return trimmed.mean(axis=1), fs / factor, start_s
 
     def _apply_levels(self, views: dict[str, np.ndarray], force: bool = False) -> None:
-        """Apply the fixed Y level; the centre only moves when the user asks."""
+        """Apply the fixed Y level; the centre only moves when the user asks.
+
+        Unlike a typical auto-range plot, the span is decided by the zoom
+        control (clamped per pane in `_autofit`) and the centre only changes on
+        Center / zoom / detail, so the trace does not drift vertically while it
+        scrolls.
+        """
         for key, pane in self.panes.items():
             values = views[key]
             if values.size and self._centers[key] is None:
@@ -1052,6 +1111,7 @@ class MainWindow(QMainWindow):
     # ---- periodic redraw
 
     def _refresh(self) -> None:
+        """One UI frame; books the next one only after this one finishes."""
         frame_t0 = time.monotonic()
         try:
             self._refresh_frame()
@@ -1064,6 +1124,7 @@ class MainWindow(QMainWindow):
     def _refresh_frame(self) -> None:
         latest_s = self.bufs.emg.total / EMG_FS
 
+        # ---- where to look: live playhead or a frozen history position
         # The slider is a timeline: far right is live, dragging left freezes
         # the view at that moment while acquisition keeps running.
         end_s = min(self._paused_end_s, latest_s) if self._paused else self._playhead_s(latest_s)
@@ -1090,11 +1151,14 @@ class MainWindow(QMainWindow):
         if self.delay_label.text() != text:
             self.delay_label.setText(text)
 
+        # Before the buffer covers a full window the axis stays [0, W] and the
+        # trace grows left to right; afterwards t0/t1 scroll with the data.
         if end_s <= self.window_s:
             t0, t1 = 0.0, float(self.window_s)
         else:
             t0, t1 = end_s - self.window_s, end_s
 
+        # ---- fetch one window per channel and apply the fixed Y levels
         views = {}
         starts = {}
         for key in self.panes:
@@ -1105,6 +1169,7 @@ class MainWindow(QMainWindow):
 
         self._apply_levels(views)
 
+        # ---- prepare (smooth/decimate/align) and hand the samples to the panes
         for key, pane in self.panes.items():
             values = views[key]
             if values.size < 2:
